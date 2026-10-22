@@ -1,0 +1,43 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+
+# Environments and local configuration
+.env
+.venv/
+env/
+venv/
+
+# Test, coverage, and type-checker output
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.pytest_cache/
+.tox/
+.nox/
+.mypy_cache/
+.ruff_cache/
+
+# Model weights / scratch outputs (never commit)
+*.pt
+*.ckpt
+*.safetensors
+weights/
+outputs/
+scratch/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+*.swp
