@@ -41,3 +41,6 @@ scratch/
 .vscode/
 .DS_Store
 *.swp
+
+# per-service venvs
+.venv/

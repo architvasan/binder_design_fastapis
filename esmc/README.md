@@ -1,8 +1,43 @@
-# esmc-service (design draft)
+# esmc-service
 
 Archetype **A** — sync vector service. The closest to the template: ESM-C is the
 same ESM-C family `genslm-esm-service` already serves, so this is nearly a copy
 with the GenSLM-specific tokenization swapped for stock ESM-C.
+
+**Status: implemented and tested.** `src/esmc_service/server.py` + `tests/`.
+ruff, mypy, and 20 pytest cases pass (incl. exact pooling-math checks); the real
+server boots and serves `/health`, `/v1/embeddings`, and `/docs`.
+
+## Install and run
+
+```bash
+cd esmc
+uv venv && source .venv/bin/activate
+uv pip install -e ".[dev]"      # pulls esm + torch (large)
+esmc-serve                       # http://localhost:8000
+```
+
+Preload a model at startup instead of on first request:
+
+```bash
+ESMC_PRELOAD_MODEL=esmc_600m esmc-serve
+```
+
+Request embeddings (mean-pooled, BOS/EOS excluded; `transformer_layer` optional,
+defaults to the final layer):
+
+```bash
+curl http://localhost:8000/v1/embeddings -H 'Content-Type: application/json' -d '{
+  "model": "esmc_600m",
+  "input": ["MTPHKGATL", "MKTAYIAKQRQISFVKSH"],
+  "transformer_layer": 12
+}'
+```
+
+Supported models: `esmc_300m` (30 layers), `esmc_600m` (36). ESM-C 6B is gated /
+Forge-served — add it to `MODEL_LAYER_COUNTS` (80 layers) once weights are local.
+
+## Original design notes
 
 ## Backend API being wrapped
 
