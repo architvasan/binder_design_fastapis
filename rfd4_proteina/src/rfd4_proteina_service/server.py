@@ -1,45 +1,47 @@
-"""FastAPI service for RFD4 / Proteina-Complexa binder design.
+"""FastAPI service for RFD4-Proteina binder/complex design.
 
-Wraps the ``complexa`` Hydra pipeline (RosettaCommons RFD4-Proteina, as ported
-to Aurora in the ``aurora-proteina-complexa`` recipe) as a design-campaign
-service. This is archetype C — an async design job — so unlike the sync
-embedding/fold/sample services it:
+Wraps the public RosettaCommons **RFD4-Proteina** model
+(``rfd4.Proteina.from_pretrained("nvidia/RFD4-Proteina")`` +
+``rfd4.generate(model, overrides=[...])``). Follows the ``genslm-esm-service``
+pattern: typed settings, an injectable backend ``Protocol`` (so the API is
+testable without a GPU or model weights), one model resident at a time, and
+inference serialized per process.
 
-* launches the pipeline as a **subprocess per request** (Hydra + ``main()``
-  carry global state, and the recipe itself runs a fresh process per call),
-* forces ``gen_njobs=1`` / ``eval_njobs=1`` (the pipeline's parallel branch
-  resets ``ZE_AFFINITY_MASK`` and would fight the node's tile pinning),
-* serializes jobs with a lock (one campaign per tile at a time), and
-* returns design **file paths** on the node's shared storage rather than inline
-  structures (a campaign produces many large files).
+This is a design-campaign service (archetype C): a request supplies the
+condition spec (a contig/conditions YAML) and generation settings; the model
+writes designs to a per-run output directory, and the service returns their
+file paths on the node's shared storage rather than inline structures.
 
-The service process is expected to run on the compute node inside the activated
-Proteina-Complexa environment (see ``deploy/aurora_serve.sh``), so ``complexa``
-is on ``PATH`` and the framework's checkpoint/cache env vars are set.
+``rfd4_proteina`` is imported lazily in :meth:`load`/:meth:`generate` so this
+module imports without it installed, which keeps the test suite GPU- and
+weight-free via the fake backend.
 
-The canonical invocation this wraps (from the recipe)::
+The canonical invocation this wraps (from the repo README)::
 
-    complexa design configs/search_binder_local_pipeline.yaml \
-        ++run_name=<unique> ++generation.task_name=<target> \
-        ++gen_njobs=1 ++eval_njobs=1 ++seed=<n>
+    import rfd4_proteina as rfd4
+    model = rfd4.Proteina.from_pretrained("nvidia/RFD4-Proteina")
+    rfd4.generate(model, overrides=["inputs=binder.yaml", "out_dir=./runs/first",
+                                    "num_replicates=2"])
 """
 
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
-import os
 import re
-import subprocess
 import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from dataclasses import field
 from pathlib import Path
+from typing import Any
+from typing import cast
 from typing import Literal
 from typing import Protocol
 
+import torch
 import uvicorn
 from fastapi import FastAPI
 from fastapi import HTTPException
@@ -47,6 +49,8 @@ from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
 from pydantic import field_validator
+from pydantic import model_validator
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings
 from pydantic_settings import SettingsConfigDict
 
@@ -54,86 +58,96 @@ from rfd4_proteina_service import __version__
 
 LOGGER = logging.getLogger(__name__)
 
-# Allowlist of pipelines mapped to their Hydra config (relative to the repo).
-# This is both the set of legal pipeline names and the config lookup.
-PIPELINES = {
-    'binder': 'configs/search_binder_local_pipeline.yaml',
+# Allowlist of model names mapped to their Hugging Face checkpoint. This is both
+# the set of legal model names and the loader lookup.
+MODEL_REPOS = {
+    'rfd4-proteina': 'nvidia/RFD4-Proteina',
 }
 
-# Overrides the service controls itself; a request may not set them (notably
-# gen_njobs/eval_njobs, which must stay 1 to preserve the node's tile pinning).
+# Overrides the service controls itself; a request may not set them.
 _RESERVED_OVERRIDE_KEYS = frozenset(
-    {'run_name', 'seed', 'gen_njobs', 'eval_njobs', 'generation.task_name'},
+    {'inputs', 'out_dir', 'num_replicates', 'seed', 'inference_experiment'},
 )
 
-# Safe identifier for task/run names: no shell metacharacters, no spaces.
+# Safe run name: no shell metacharacters, no spaces.
 _NAME_RE = re.compile(r'^[A-Za-z0-9._-]+$')
 # A single Hydra override token: key=value, optional +/++ prefix.
 _OVERRIDE_RE = re.compile(r'^\+?\+?[A-Za-z0-9_.]+=[A-Za-z0-9_./:-]+$')
-
-# Structure extensions a design campaign writes.
+# Structure extensions a design run writes.
 _STRUCTURE_SUFFIXES = ('.cif', '.pdb')
 
 
 class Settings(BaseSettings):
-    """Configuration loaded from ``PROTEINA_*`` environment variables."""
+    """Configuration loaded from ``RFD4_*`` environment variables."""
 
     model_config = SettingsConfigDict(
-        env_prefix='PROTEINA_',
+        env_prefix='RFD4_',
         env_file='.env',
         env_file_encoding='utf-8',
         extra='ignore',
     )
 
-    # Defaults are the Aurora port paths from the aurora-proteina-complexa
-    # recipe; override via PROTEINA_REPO_DIR / PROTEINA_COMMAND / etc.
-    repo_dir: str = '/lus/flare/projects/FRAME-IDP/mmeigooni/software/Proteina-Complexa'
-    command: str = 'complexa'
-    runs_root: str | None = None
-    job_timeout: float = Field(default=3600.0, gt=0)
+    hf_token: SecretStr | None = None
+    hf_revision: str | None = None
+    preload_model: str | None = None
+    runs_root: str = './runs'
     host: str = '0.0.0.0'
     port: int = Field(default=8000, ge=1, le=65535)
 
-    def resolved_runs_root(self) -> Path:
-        """Return the base directory for run outputs (default ``<repo>/runs``)."""
-        if self.runs_root is not None:
-            return Path(self.runs_root)
-        return Path(self.repo_dir) / 'runs'
+    @field_validator('preload_model')
+    @classmethod
+    def validate_preload_model(cls, value: str | None) -> str | None:
+        """Only allow a supported checkpoint to be preloaded."""
+        if value is not None and value not in MODEL_REPOS:
+            raise ValueError(f'preload_model must be one of {sorted(MODEL_REPOS)}')
+        return value
 
 
 class DesignRequest(BaseModel):
-    """Request to run one Proteina-Complexa binder-design campaign."""
+    """Request to run one RFD4-Proteina design campaign."""
 
     model_config = ConfigDict(extra='forbid')
 
-    task_name: str = Field(
-        description='Target key configured in the repo (e.g. 02_PDL1).',
+    model: str = 'rfd4-proteina'
+    inputs_yaml: str | None = Field(
+        default=None,
+        description='The condition-spec YAML (contig/conditions) as text.',
     )
-    pipeline: str = 'binder'
+    inputs_path: str | None = Field(
+        default=None,
+        description='Path to an existing condition-spec YAML on the node.',
+    )
     run_name: str | None = Field(
         default=None,
         description='Unique run name; auto-generated when omitted.',
     )
-    seed: int = Field(default=42, ge=0)
-    extra_overrides: list[str] = Field(
-        default_factory=list,
-        description='Additional Hydra overrides as key=value tokens.',
-    )
+    num_replicates: int = Field(default=1, ge=1, le=100)
+    seed: int = Field(default=0, ge=0)
+    inference_experiment: str = Field(default='quickstart')
+    extra_overrides: list[str] = Field(default_factory=list)
 
-    @field_validator('pipeline')
+    @field_validator('model')
     @classmethod
-    def validate_pipeline(cls, value: str) -> str:
-        """Only allow supported pipelines."""
-        if value not in PIPELINES:
-            raise ValueError(f'pipeline must be one of {sorted(PIPELINES)}')
+    def validate_model(cls, value: str) -> str:
+        """Only allow supported checkpoints."""
+        if value not in MODEL_REPOS:
+            raise ValueError(f'model must be one of {sorted(MODEL_REPOS)}')
         return value
 
-    @field_validator('task_name', 'run_name')
+    @field_validator('run_name')
     @classmethod
-    def validate_name(cls, value: str | None) -> str | None:
-        """Reject names with shell metacharacters or spaces."""
+    def validate_run_name(cls, value: str | None) -> str | None:
+        """Reject run names with shell metacharacters or spaces."""
         if value is not None and not _NAME_RE.match(value):
-            raise ValueError('name must match [A-Za-z0-9._-]+')
+            raise ValueError('run_name must match [A-Za-z0-9._-]+')
+        return value
+
+    @field_validator('inference_experiment')
+    @classmethod
+    def validate_experiment(cls, value: str) -> str:
+        """Reject experiment names with unsafe characters."""
+        if not _NAME_RE.match(value):
+            raise ValueError('inference_experiment must match [A-Za-z0-9._-]+')
         return value
 
     @field_validator('extra_overrides')
@@ -148,6 +162,15 @@ class DesignRequest(BaseModel):
                 raise ValueError(f'override {key!r} is controlled by the service')
         return value
 
+    @model_validator(mode='after')
+    def validate_inputs_source(self) -> DesignRequest:
+        """Require exactly one of inputs_yaml / inputs_path."""
+        if (self.inputs_yaml is None) == (self.inputs_path is None):
+            raise ValueError('provide exactly one of inputs_yaml or inputs_path')
+        if self.inputs_yaml is not None and not self.inputs_yaml.strip():
+            raise ValueError('inputs_yaml must not be empty')
+        return self
+
 
 class DesignItem(BaseModel):
     """One produced design (a structure file on the node's storage)."""
@@ -161,14 +184,11 @@ class DesignResponse(BaseModel):
     """Result of a design campaign: where it ran and what it produced."""
 
     object: Literal['design'] = 'design'
-    pipeline: str
-    task_name: str
+    model: str
     run_name: str
     output_dir: str
-    returncode: int
     num_designs: int
     designs: list[DesignItem]
-    log_tail: str
 
 
 @dataclass
@@ -177,59 +197,97 @@ class DesignOutput:
 
     run_name: str
     output_dir: str
-    returncode: int
-    designs: list[DesignItem]
-    log_tail: str = field(default='')
+    designs: list[DesignItem] = field(default_factory=list)
 
 
 class DesignBackend(Protocol):
     """Interface used by the HTTP layer and test backends."""
+
+    def load(self, model_id: str) -> object:
+        """Load or return the requested model."""
+
+    def unload(self) -> None:
+        """Release the resident model."""
 
     def generate(self, request: DesignRequest) -> DesignOutput:
         """Run one design campaign and return its outputs."""
         ...
 
 
-def _tail(text: str, limit: int = 4000) -> str:
-    """Return the last ``limit`` characters of ``text``."""
-    return text[-limit:]
+@dataclass
+class LoadedModel:
+    """The single model currently resident in memory."""
+
+    model_id: str
+    model: object
 
 
 class ProteinaBackend:
-    """Run the Proteina-Complexa pipeline as a subprocess per campaign."""
+    """Load one RFD4-Proteina model and run design campaigns in-process."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self.loaded: LoadedModel | None = None
 
-    def _build_argv(
+    def load(self, model_id: str) -> LoadedModel:
+        """Load or return the requested model."""
+        if self.loaded is not None and self.loaded.model_id == model_id:
+            return self.loaded
+
+        self.unload()
+        LOGGER.info('Loading model %s', model_id)
+        if self.settings.hf_token is not None:
+            from huggingface_hub import login  # noqa: PLC0415
+
+            login(
+                token=self.settings.hf_token.get_secret_value(),
+                add_to_git_credential=False,
+            )
+
+        import rfd4_proteina as rfd4  # noqa: PLC0415
+
+        repo = MODEL_REPOS[model_id]
+        proteina = cast(Any, rfd4).Proteina
+        if self.settings.hf_revision is not None:
+            model = proteina.from_pretrained(repo, revision=self.settings.hf_revision)
+        else:
+            model = proteina.from_pretrained(repo)
+
+        self.loaded = LoadedModel(model_id, model)
+        LOGGER.info('Loaded model %s', model_id)
+        return self.loaded
+
+    def unload(self) -> None:
+        """Release the resident model and unused accelerator allocations."""
+        if self.loaded is None:
+            return
+        self.loaded = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _build_overrides(
         self,
         request: DesignRequest,
-        run_name: str,
+        inputs_arg: str,
         out_dir: Path,
     ) -> list[str]:
-        """Assemble the ``complexa design`` command line (no shell)."""
-        config = PIPELINES[request.pipeline]
+        """Assemble the Hydra override list passed to rfd4.generate."""
         return [
-            self.settings.command,
-            'design',
-            config,
-            f'++run_name={run_name}',
-            f'++generation.task_name={request.task_name}',
-            # NOTE: output location key is best-effort; confirm against
-            # configs/search_binder_local_pipeline.yaml + docs/INFERENCE.md.
+            f'inputs={inputs_arg}',
             f'out_dir={out_dir}',
-            '++gen_njobs=1',
-            '++eval_njobs=1',
-            f'++seed={request.seed}',
+            f'num_replicates={request.num_replicates}',
+            f'seed={request.seed}',
+            f'inference_experiment={request.inference_experiment}',
             *request.extra_overrides,
         ]
 
     def _collect_designs(self, out_dir: Path) -> list[DesignItem]:
         """Gather produced structures from the run directory.
 
-        NOTE: the exact layout is confirmed on-cluster against
-        ``docs/INFERENCE.md``; designs are written under an
-        ``inference_samples`` directory, with a fallback to any structure file.
+        NOTE: designs are written under ``<out_dir>/inference_samples/`` per the
+        repo README; confirm the exact layout against the repo's inference docs.
+        Falls back to any structure file under the run directory.
         """
         candidates: list[Path] = []
         for sample_dir in out_dir.rglob('inference_samples'):
@@ -248,51 +306,34 @@ class ProteinaBackend:
         ]
 
     def generate(self, request: DesignRequest) -> DesignOutput:
-        """Launch the campaign, verify it, and collect its designs."""
-        run_name = request.run_name or (
-            f'{request.task_name}-{request.seed}-{uuid.uuid4().hex[:8]}'
-        )
-        out_dir = self.settings.resolved_runs_root() / run_name
-        argv = self._build_argv(request, run_name, out_dir)
-        LOGGER.info('Launching Proteina campaign: %s', ' '.join(argv))
+        """Run the campaign in-process and collect its designs."""
+        import rfd4_proteina as rfd4  # noqa: PLC0415
 
-        try:
-            proc = subprocess.run(
-                argv,
-                cwd=self.settings.repo_dir,
-                env=os.environ.copy(),
-                capture_output=True,
-                text=True,
-                timeout=self.settings.job_timeout,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as error:
-            raise RuntimeError(
-                f'Proteina campaign timed out after {self.settings.job_timeout}s',
-            ) from error
-        except FileNotFoundError as error:
-            raise RuntimeError(
-                f'Proteina command not found: {self.settings.command!r}',
-            ) from error
+        run_name = request.run_name or f'rfd4-{request.seed}-{uuid.uuid4().hex[:8]}'
+        out_dir = Path(self.settings.runs_root) / run_name
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-        log_tail = _tail((proc.stdout or '') + (proc.stderr or ''))
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f'Proteina campaign failed (rc={proc.returncode}): {log_tail}',
-            )
+        if request.inputs_yaml is not None:
+            inputs_file = out_dir / 'inputs.yaml'
+            inputs_file.write_text(request.inputs_yaml)
+            inputs_arg = str(inputs_file)
+        else:
+            inputs_arg = cast(str, request.inputs_path)
+
+        overrides = self._build_overrides(request, inputs_arg, out_dir)
+        loaded = self.load(request.model)
+        LOGGER.info('Running rfd4.generate with overrides: %s', overrides)
+        with torch.inference_mode():
+            cast(Any, rfd4).generate(loaded.model, overrides=overrides)
 
         designs = self._collect_designs(out_dir)
         if not designs:
-            raise RuntimeError(
-                f'Proteina campaign produced no designs in {out_dir}',
-            )
+            raise RuntimeError(f'campaign produced no designs in {out_dir}')
 
         return DesignOutput(
             run_name=run_name,
             output_dir=str(out_dir),
-            returncode=proc.returncode,
             designs=designs,
-            log_tail=log_tail,
         )
 
 
@@ -307,39 +348,41 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
-        yield
+        if app_settings.preload_model is not None:
+            await asyncio.to_thread(design_backend.load, app_settings.preload_model)
+        try:
+            yield
+        finally:
+            design_backend.unload()
 
     app = FastAPI(
-        title='RFD4 / Proteina-Complexa Design API',
+        title='RFD4-Proteina Design API',
         version=__version__,
         lifespan=lifespan,
     )
 
     @app.get('/health', tags=['health'])
     async def health() -> dict[str, str]:
-        """Report process health without launching a campaign."""
+        """Report process health without forcing a model download."""
         return {'status': 'healthy'}
 
     @app.post('/v1/design', response_model=DesignResponse, tags=['design'])
     async def design(request: DesignRequest) -> DesignResponse:
-        """Run one binder-design campaign and return its produced designs."""
+        """Run one design campaign and return its produced designs."""
         try:
-            # Serialize campaigns: one model job per assigned tile at a time.
+            # Serialize campaigns: one resident model / accelerator at a time.
             async with inference_lock:
                 output = await asyncio.to_thread(design_backend.generate, request)
-        except (RuntimeError, ValueError) as error:
+        except (RuntimeError, ValueError, OSError) as error:
             LOGGER.exception('Design campaign failed')
             raise HTTPException(status_code=500, detail=str(error)) from error
 
         return DesignResponse(
-            pipeline=request.pipeline,
-            task_name=request.task_name,
+            model=request.model,
             run_name=output.run_name,
             output_dir=output.output_dir,
-            returncode=output.returncode,
             num_designs=len(output.designs),
             designs=output.designs,
-            log_tail=output.log_tail,
         )
 
     return app

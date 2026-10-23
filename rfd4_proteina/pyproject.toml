@@ -20,13 +20,16 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: Implementation :: CPython",
 ]
-# NOTE: Proteina-Complexa / RFD4 is NOT installed as a dependency here. The
-# service shells out to the `complexa` CLI, which lives in its own (Aurora XPU
-# or CUDA) environment; the server process runs inside that activated env. See
-# the README and deploy/aurora_serve.sh. The test suite fakes the subprocess.
+# NOTE: rfd4-proteina (RosettaCommons/RFD4-Proteina) is NOT pinned here. Install
+# it into the serving env with its CUDA extra, e.g.
+#   uv pip install "rfd4-proteina[all-cuda13]"
+# (or `make setup` in a repo clone). The server loads it in-process; the test
+# suite stubs it.
 dependencies = [
     "fastapi>=0.115",
+    "huggingface-hub>=0.24",
     "pydantic-settings>=2.0",
+    "torch>=2.2",
     "uvicorn[standard]>=0.30",
 ]
 
@@ -149,3 +152,7 @@ no_implicit_optional = true
 warn_redundant_casts = true
 warn_unused_configs = true
 warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = ["rfd4_proteina", "rfd4_proteina.*", "huggingface_hub", "huggingface_hub.*"]
+ignore_missing_imports = true
