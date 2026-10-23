@@ -45,7 +45,7 @@ class FakeBackend:
         num_diffusion_samples: int,
         seed: int,
         return_pae: bool,
-    ) -> FoldOutput:
+    ) -> list[FoldOutput]:
         self.fold_calls.append(
             {
                 'model': model,
@@ -58,13 +58,15 @@ class FakeBackend:
             },
         )
         total = sum(len(chain.sequence) for chain in chains)
-        return FoldOutput(
-            mmcif='CIF',
-            plddt=[float(index) for index in range(total)],
-            ptm=0.5,
-            iptm=0.8 if len(chains) > 1 else None,
-            pae=[[0.0, 1.0]] if return_pae else None,
-        )
+        return [
+            FoldOutput(
+                mmcif='CIF',
+                plddt=[float(index) for index in range(total)],
+                ptm=0.5,
+                iptm=0.8 if len(chains) > 1 else None,
+                pae=[[0.0, 1.0]] if return_pae else None,
+            ),
+        ]
 
 
 @pytest.fixture
@@ -82,15 +84,19 @@ def test_single_chain_fold(client: TestClient) -> None:
     assert response.status_code == HTTP_200_OK
     body = response.json()
     assert body['object'] == 'fold'
-    assert body['format'] == 'mmcif'
-    assert body['structure'] == 'CIF'
     assert body['num_chains'] == 1
     assert body['chain_ids'] == ['A']
-    assert body['plddt'] == [0.0, 1.0, 2.0]
-    assert body['plddt_mean'] == 1.0
-    assert body['ptm'] == 0.5
-    assert body['iptm'] is None
-    assert body['pae'] is None
+    assert body['num_samples'] == 1
+    assert len(body['results']) == 1
+    sample = body['results'][0]
+    assert sample['format'] == 'mmcif'
+    assert sample['structure'] == 'CIF'
+    assert sample['plddt'] == [0.0, 1.0, 2.0]
+    assert sample['plddt_mean'] == 1.0
+    assert sample['ptm'] == 0.5
+    assert sample['iptm'] is None
+    assert sample['pae'] is None
+    assert sample['ranking_score'] == 0.5
     assert body['usage'] == {'num_chains': 1, 'total_residues': 3}
 
 
@@ -110,7 +116,9 @@ def test_multichain_assigns_sequential_ids() -> None:
     body = response.json()
     assert body['chain_ids'] == ['A', 'B']
     assert body['num_chains'] == 2
-    assert body['iptm'] == 0.8
+    assert body['results'][0]['iptm'] == 0.8
+    # Complex ranking score: 0.8*iptm + 0.2*ptm = 0.8*0.8 + 0.2*0.5 = 0.74.
+    assert body['results'][0]['ranking_score'] == pytest.approx(0.74)
     assert body['usage'] == {'num_chains': 2, 'total_residues': 5}
     assert backend.fold_calls[0]['chain_ids'] == ['A', 'B']
 
@@ -185,7 +193,46 @@ def test_return_pae_includes_matrix(client: TestClient) -> None:
     )
 
     assert response.status_code == HTTP_200_OK
-    assert response.json()['pae'] == [[0.0, 1.0]]
+    assert response.json()['results'][0]['pae'] == [[0.0, 1.0]]
+
+
+class _MultiSampleBackend:
+    """Backend returning several samples out of rank order (monomer scores)."""
+
+    def load(self, model_id: str) -> None:
+        return None
+
+    def unload(self) -> None:
+        return None
+
+    def fold(self, model: str, chains: list[ChainSpec], **_: Any) -> list[FoldOutput]:
+        return [
+            FoldOutput(mmcif='c1', plddt=[10.0], ptm=0.30, iptm=None, pae=None),
+            FoldOutput(mmcif='c2', plddt=[90.0], ptm=0.90, iptm=None, pae=None),
+            FoldOutput(mmcif='c3', plddt=[60.0], ptm=0.60, iptm=None, pae=None),
+        ]
+
+
+def test_results_are_ranked_best_first() -> None:
+    client = TestClient(create_app(Settings(), _MultiSampleBackend()))
+
+    response = client.post(
+        '/v1/fold',
+        json={
+            'model': 'esmfold2',
+            'sequences': [{'sequence': 'MKT'}],
+            'num_diffusion_samples': 3,
+        },
+    )
+
+    assert response.status_code == HTTP_200_OK
+    body = response.json()
+    assert body['num_samples'] == 3
+    # Monomer, so ranking_score == ptm; best structure first.
+    assert [sample['structure'] for sample in body['results']] == ['c2', 'c3', 'c1']
+    scores = [sample['ranking_score'] for sample in body['results']]
+    assert scores == sorted(scores, reverse=True)
+    assert scores == [0.9, 0.6, 0.3]
 
 
 def test_lowercase_sequence_is_uppercased() -> None:
@@ -345,13 +392,20 @@ def _install_fake_esm(
         last_spi: Any = None
         last_kwargs: Any = None
 
-        def fold(self, model: object, spi: Any, **kwargs: object) -> _Result:
+        def fold(self, model: object, spi: Any, **kwargs: object) -> Any:
             type(self).last_spi = spi
             type(self).last_kwargs = kwargs
             total = sum(len(chain.sequence) for chain in spi.sequences)
             plddt = torch.arange(total, dtype=torch.float32)
             pae = torch.tensor([[0.0, 1.0], [2.0, 3.0]])
-            return _Result(plddt, 0.5, 0.8, _Complex('data_pred\n'), pae)
+            samples = int(kwargs.get('num_diffusion_samples', 1))  # type: ignore[call-overload]
+            # Mirror the SDK: one result for a single sample, a list otherwise.
+            if samples == 1:
+                return _Result(plddt, 0.5, 0.8, _Complex('data_pred\n'), pae)
+            return [
+                _Result(plddt, 0.5 + 0.1 * i, 0.8, _Complex(f'data_pred_{i}\n'), pae)
+                for i in range(samples)
+            ]
 
     module = types.ModuleType('esm.models.esmfold2')
     module.EsmFold2Model = EsmFold2Model  # type: ignore[attr-defined]
@@ -408,7 +462,7 @@ def test_fold_builds_complex_and_maps_result(
 
     backend = EsmFold2Backend(Settings())
     chains = [ChainSpec(id='A', sequence='MKT'), ChainSpec(id='B', sequence='AA')]
-    output = backend.fold(
+    outputs = backend.fold(
         'esmfold2',
         chains,
         num_loops=7,
@@ -418,6 +472,8 @@ def test_fold_builds_complex_and_maps_result(
         return_pae=True,
     )
 
+    assert len(outputs) == 1
+    output = outputs[0]
     # 5 residues total -> plddt = [0, 1, 2, 3, 4].
     assert output.plddt == [0.0, 1.0, 2.0, 3.0, 4.0]
     assert output.ptm == 0.5
@@ -443,7 +499,7 @@ def test_fold_omits_pae_when_not_requested(
     _install_fake_esm(monkeypatch)
 
     backend = EsmFold2Backend(Settings())
-    output = backend.fold(
+    outputs = backend.fold(
         'esmfold2',
         [ChainSpec(id='A', sequence='MK')],
         num_loops=20,
@@ -453,4 +509,32 @@ def test_fold_omits_pae_when_not_requested(
         return_pae=False,
     )
 
-    assert output.pae is None
+    assert outputs[0].pae is None
+
+
+def test_fold_returns_one_output_per_sample(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: False)
+    _install_fake_esm(monkeypatch)
+
+    backend = EsmFold2Backend(Settings())
+    # num_diffusion_samples > 1 -> the SDK returns a list; the backend must map
+    # every sample, not assume a single result.
+    outputs = backend.fold(
+        'esmfold2',
+        [ChainSpec(id='A', sequence='MK')],
+        num_loops=20,
+        num_sampling_steps=100,
+        num_diffusion_samples=3,
+        seed=0,
+        return_pae=False,
+    )
+
+    assert len(outputs) == 3
+    assert [output.ptm for output in outputs] == [0.5, 0.6, pytest.approx(0.7)]
+    assert [output.mmcif for output in outputs] == [
+        'data_pred_0\n',
+        'data_pred_1\n',
+        'data_pred_2\n',
+    ]

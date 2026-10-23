@@ -200,32 +200,54 @@ class FoldUsage(BaseModel):
     total_residues: int
 
 
-class FoldResponse(BaseModel):
-    """A predicted complex structure and its confidence scores."""
+class FoldSample(BaseModel):
+    """One predicted structure sample and its confidence scores."""
 
-    object: Literal['fold'] = 'fold'
-    model: str
-    format: Literal['mmcif'] = 'mmcif'
     structure: str
-    num_chains: int
-    chain_ids: list[str]
+    format: Literal['mmcif'] = 'mmcif'
     plddt_mean: float
     plddt: list[float]
     ptm: float
     iptm: float | None = None
     pae: list[list[float]] | None = None
+    ranking_score: float = Field(
+        description='Quality score used to rank samples; higher is better. '
+        '0.8*iptm + 0.2*ptm for complexes, else ptm.',
+    )
+
+
+class FoldResponse(BaseModel):
+    """All predicted samples for one request, ranked best structure first."""
+
+    object: Literal['fold'] = 'fold'
+    model: str
+    num_chains: int
+    chain_ids: list[str]
+    num_samples: int
+    results: list[FoldSample]
     usage: FoldUsage
 
 
 @dataclass
 class FoldOutput:
-    """Backend fold result, decoupled from the HTTP response model."""
+    """One backend fold sample, decoupled from the HTTP response model."""
 
     mmcif: str
     plddt: list[float]
     ptm: float
     iptm: float | None
     pae: list[list[float]] | None = field(default=None)
+
+
+def ranking_score(ptm: float, iptm: float | None) -> float:
+    """Rank samples by overall quality; higher is better.
+
+    Uses the AlphaFold-Multimer convention ``0.8*iptm + 0.2*ptm`` when an
+    interface score is available (multichain complexes), otherwise ``ptm``.
+    """
+    if iptm is not None:
+        return 0.8 * iptm + 0.2 * ptm
+    return ptm
 
 
 class FoldBackend(Protocol):
@@ -247,8 +269,8 @@ class FoldBackend(Protocol):
         num_diffusion_samples: int,
         seed: int,
         return_pae: bool,
-    ) -> FoldOutput:
-        """Fold the chains into a single complex."""
+    ) -> list[FoldOutput]:
+        """Fold the chains into one or more complex samples."""
         ...
 
 
@@ -321,8 +343,8 @@ class EsmFold2Backend:
         num_diffusion_samples: int,
         seed: int,
         return_pae: bool,
-    ) -> FoldOutput:
-        """Fold the chains into one complex and map the result to FoldOutput."""
+    ) -> list[FoldOutput]:
+        """Fold the chains and map every sample to a FoldOutput."""
         from esm.models.esmfold2 import ESMFold2InputBuilder  # noqa: PLC0415
         from esm.models.esmfold2 import ProteinInput  # noqa: PLC0415
         from esm.models.esmfold2 import StructurePredictionInput  # noqa: PLC0415
@@ -337,25 +359,35 @@ class EsmFold2Backend:
         )
 
         with torch.inference_mode():
-            result = cast(
-                Any,
-                ESMFold2InputBuilder().fold(
-                    net,
-                    spi,
-                    num_loops=num_loops,
-                    num_sampling_steps=num_sampling_steps,
-                    num_diffusion_samples=num_diffusion_samples,
-                    seed=seed,
-                ),
+            result = ESMFold2InputBuilder().fold(
+                net,
+                spi,
+                num_loops=num_loops,
+                num_sampling_steps=num_sampling_steps,
+                num_diffusion_samples=num_diffusion_samples,
+                seed=seed,
             )
 
-        plddt = [
-            float(value) for value in result.plddt.float().cpu().reshape(-1).tolist()
-        ]
-        iptm = None if result.iptm is None else float(result.iptm)
+        # fold() returns a single result when num_diffusion_samples == 1 and a
+        # list when more than one sample is drawn; normalise to a list so the
+        # service always returns one FoldOutput per sample.
+        samples = result if isinstance(result, list) else [result]
+        return [self._map_sample(cast(Any, sample), return_pae) for sample in samples]
+
+    @staticmethod
+    def _map_sample(sample: Any, return_pae: bool) -> FoldOutput:
+        """Map one ESMFold2 result to a FoldOutput, guarding optional scores."""
+        plddt: list[float] = []
+        if sample.plddt is not None:
+            plddt = [
+                float(value)
+                for value in sample.plddt.float().cpu().reshape(-1).tolist()
+            ]
+        ptm = 0.0 if sample.ptm is None else float(sample.ptm)
+        iptm = None if sample.iptm is None else float(sample.iptm)
         pae: list[list[float]] | None = None
         if return_pae:
-            raw_pae = getattr(result, 'pae', None)
+            raw_pae = getattr(sample, 'pae', None)
             if raw_pae is not None:
                 pae = [
                     [float(value) for value in row]
@@ -363,9 +395,9 @@ class EsmFold2Backend:
                 ]
 
         return FoldOutput(
-            mmcif=result.complex.to_mmcif(),
+            mmcif=sample.complex.to_mmcif(),
             plddt=plddt,
-            ptm=float(result.ptm),
+            ptm=ptm,
             iptm=iptm,
             pae=pae,
         )
@@ -408,7 +440,7 @@ def create_app(
             # Keep the event loop responsive while serializing access to the
             # resident model and accelerator within this server process.
             async with inference_lock:
-                output = await asyncio.to_thread(
+                outputs = await asyncio.to_thread(
                     fold_backend.fold,
                     request.model,
                     chains,
@@ -422,17 +454,29 @@ def create_app(
             LOGGER.exception('Fold request failed')
             raise HTTPException(status_code=500, detail=str(error)) from error
 
-        plddt_mean = sum(output.plddt) / len(output.plddt) if output.plddt else 0.0
+        samples = [
+            FoldSample(
+                structure=output.mmcif,
+                plddt_mean=(
+                    sum(output.plddt) / len(output.plddt) if output.plddt else 0.0
+                ),
+                plddt=output.plddt,
+                ptm=output.ptm,
+                iptm=output.iptm,
+                pae=output.pae,
+                ranking_score=ranking_score(output.ptm, output.iptm),
+            )
+            for output in outputs
+        ]
+        # Best structure first; the request may draw several diffusion samples.
+        samples.sort(key=lambda sample: sample.ranking_score, reverse=True)
+
         return FoldResponse(
             model=request.model,
-            structure=output.mmcif,
             num_chains=len(chains),
             chain_ids=[chain.id for chain in chains],
-            plddt_mean=plddt_mean,
-            plddt=output.plddt,
-            ptm=output.ptm,
-            iptm=output.iptm,
-            pae=output.pae,
+            num_samples=len(samples),
+            results=samples,
             usage=FoldUsage(
                 num_chains=len(chains),
                 total_residues=sum(len(chain.sequence) for chain in chains),

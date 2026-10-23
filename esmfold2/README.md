@@ -49,24 +49,37 @@ curl http://localhost:8000/v1/fold -H 'Content-Type: application/json' -d '{
 }'
 ```
 
-Response (`structure` is mmCIF text; `plddt` is per-residue):
+Response — `results` holds one entry per diffusion sample, **ranked best
+structure first** (by `ranking_score`). Each sample's `structure` is mmCIF text
+and `plddt` is per-residue:
 
 ```json
 {
   "object": "fold",
   "model": "esmfold2",
-  "format": "mmcif",
-  "structure": "data_pred\n...",
   "num_chains": 2,
   "chain_ids": ["A", "B"],
-  "plddt_mean": 84.2,
-  "plddt": [/* per residue */],
-  "ptm": 0.81,
-  "iptm": 0.62,
-  "pae": null,
+  "num_samples": 1,
+  "results": [
+    {
+      "format": "mmcif",
+      "structure": "data_pred\n...",
+      "plddt_mean": 84.2,
+      "plddt": [/* per residue */],
+      "ptm": 0.81,
+      "iptm": 0.62,
+      "pae": null,
+      "ranking_score": 0.648
+    }
+  ],
   "usage": {"num_chains": 2, "total_residues": 53}
 }
 ```
+
+`ranking_score` is the quality metric the samples are sorted by (higher is
+better): `0.8*iptm + 0.2*ptm` for complexes, else `ptm`. With
+`num_diffusion_samples > 1`, `results` lists every sample in that order so the
+caller can pick an alternative.
 
 ### Request fields
 
@@ -87,7 +100,7 @@ Supported models: `esmfold2` (`biohub/ESMFold2`) and `esmfold2-fast`
 ## HTTP contract
 
 ```
-POST /v1/fold   -> {object:'fold', structure, chain_ids, plddt, ptm, iptm, pae?, usage}
+POST /v1/fold   -> {object:'fold', chain_ids, num_samples, results:[{structure, plddt, ptm, iptm, pae?, ranking_score}], usage}
 GET  /health
 ```
 
