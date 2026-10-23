@@ -44,12 +44,13 @@ LOGGER = logging.getLogger(__name__)
 
 # The allowlist of locally loadable ESM-C checkpoints mapped to their
 # transformer-layer count. This is both the set of legal models and the
-# per-model metadata the layer-bounds validation reads. ESM-C 6B is gated and
-# typically served through Forge rather than loaded locally, so it is omitted;
-# add it here with its layer count (80) once local weights are available.
+# per-model metadata the layer-bounds validation reads. All three checkpoints
+# are public on the HuggingFace Hub (``biohub/ESMC-*``) and load locally; the
+# 6B weights are large (~12 GB in bf16) and download on first use.
 MODEL_LAYER_COUNTS = {
     'esmc_300m': 30,
     'esmc_600m': 36,
+    'esmc_6b': 80,
 }
 
 
@@ -250,8 +251,18 @@ class EsmcEmbeddingBackend:
         # The ESM-C module exposes custom encode/logits methods beyond the
         # nn.Module interface, so address it dynamically.
         net = cast(Any, loaded.model)
-        n_layers = MODEL_LAYER_COUNTS[model]
-        config = LogitsConfig(return_hidden_states=True, ith_hidden_layer=-1)
+        # Request a single hidden layer rather than all of them. The SDK's
+        # all-layers mode (ith_hidden_layer=-1) is unsupported for ESM-C 6B, and
+        # a single-layer request also keeps memory flat for the 80-block model.
+        # The SDK indexes hidden states 0-based with index 0 = the first block's
+        # output, so a 1-based transformer layer k maps to ith_hidden_layer
+        # k - 1; the final layer is k = len(blocks). This is verified to match
+        # the previous all-layers indexing bit-for-bit on esmc_300m.
+        ith_hidden_layer = transformer_layer - 1
+        config = LogitsConfig(
+            return_hidden_states=True,
+            ith_hidden_layer=ith_hidden_layer,
+        )
         result: list[list[float]] = []
 
         with torch.inference_mode():
@@ -261,16 +272,17 @@ class EsmcEmbeddingBackend:
                 hidden_states = output.hidden_states
                 if hidden_states is None:
                     raise RuntimeError('model did not return hidden states')
-                # Shape is [n_layers + 1, batch, length, dim]: index 0 is the
-                # input embedding and index k (1-based) is transformer block k.
-                if hidden_states.shape[0] != n_layers + 1:
+                # A single-layer request returns shape [1, batch, length, dim].
+                # An out-of-range layer comes back empty ([0, ...]), so guard
+                # before indexing to turn that into a clear error.
+                if hidden_states.shape[0] != 1:
                     raise RuntimeError(
-                        f'expected {n_layers + 1} hidden layers, '
-                        f'got {hidden_states.shape[0]}',
+                        f'expected one hidden state for transformer layer '
+                        f'{transformer_layer}, got {hidden_states.shape[0]}',
                     )
                 # One sequence per call, so batch index 0; exclude the BOS and
                 # EOS tokens ESM-C adds before mean-pooling over residues.
-                layer = hidden_states[transformer_layer][0]
+                layer = hidden_states[0][0]
                 pooled = layer[1:-1].mean(dim=0)
                 result.append(pooled.float().cpu().tolist())
         return result
