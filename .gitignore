@@ -44,3 +44,6 @@ scratch/
 
 # per-service venvs
 .venv/
+
+# ad-hoc curl/test capture logs
+*.log
