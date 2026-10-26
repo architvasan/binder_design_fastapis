@@ -57,7 +57,7 @@ class FakeBackend:
                 'return_pae': return_pae,
             },
         )
-        total = sum(len(chain.sequence) for chain in chains)
+        total = sum(len(chain.sequence or '') for chain in chains)
         return [
             FoldOutput(
                 mmcif='CIF',
@@ -235,6 +235,141 @@ def test_results_are_ranked_best_first() -> None:
     assert scores == [0.9, 0.6, 0.3]
 
 
+def test_dna_and_rna_chains_accepted() -> None:
+    backend = FakeBackend()
+    client = TestClient(create_app(Settings(), backend))
+
+    response = client.post(
+        '/v1/fold',
+        json={
+            'model': 'esmfold2',
+            'sequences': [
+                {'type': 'protein', 'sequence': 'MKT'},
+                {'type': 'dna', 'sequence': 'ACGT'},
+                {'type': 'rna', 'sequence': 'ACGU'},
+            ],
+        },
+    )
+
+    assert response.status_code == HTTP_200_OK
+    body = response.json()
+    assert body['chain_ids'] == ['A', 'B', 'C']
+    # All three polymer chains count toward total_residues: 3 + 4 + 4.
+    assert body['usage']['total_residues'] == 11
+
+
+def test_ligand_chain_accepted_with_smiles() -> None:
+    backend = FakeBackend()
+    client = TestClient(create_app(Settings(), backend))
+
+    response = client.post(
+        '/v1/fold',
+        json={
+            'model': 'esmfold2',
+            'sequences': [
+                {'type': 'protein', 'sequence': 'MKT'},
+                {'type': 'ligand', 'smiles': 'CC(=O)Oc1ccccc1C(=O)O'},
+            ],
+        },
+    )
+
+    assert response.status_code == HTTP_200_OK
+    body = response.json()
+    assert body['num_chains'] == 2
+    # The ligand has no sequence, so only the protein's 3 residues are counted.
+    assert body['usage']['total_residues'] == 3
+
+
+def test_ligand_chain_accepted_with_ccd() -> None:
+    backend = FakeBackend()
+    client = TestClient(create_app(Settings(), backend))
+
+    response = client.post(
+        '/v1/fold',
+        json={
+            'model': 'esmfold2',
+            'sequences': [
+                {'type': 'protein', 'sequence': 'MKT'},
+                {'type': 'ligand', 'ccd': ['HEM']},
+            ],
+        },
+    )
+
+    assert response.status_code == HTTP_200_OK
+
+
+def test_backend_maps_each_chain_type_to_its_sdk_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: False)
+    module = _install_fake_esm(monkeypatch)
+
+    backend = EsmFold2Backend(Settings())
+    chains = [
+        ChainSpec(id='A', type='protein', sequence='MKT'),
+        ChainSpec(id='B', type='dna', sequence='ACGT'),
+        ChainSpec(id='C', type='rna', sequence='ACGU'),
+        ChainSpec(id='D', type='ligand', smiles='CCO'),
+        ChainSpec(id='E', type='ligand', ccd=('HEM',)),
+    ]
+    backend.fold(
+        'esmfold2',
+        chains,
+        num_loops=20,
+        num_sampling_steps=100,
+        num_diffusion_samples=1,
+        seed=0,
+        return_pae=False,
+    )
+
+    built = module.ESMFold2InputBuilder.last_spi.sequences
+    assert [type(item).__name__ for item in built] == [
+        'ProteinInput',
+        'DNAInput',
+        'RNAInput',
+        'LigandInput',
+        'LigandInput',
+    ]
+    assert built[3].smiles == 'CCO'
+    assert built[3].ccd is None
+    assert built[4].ccd == ['HEM']
+    assert built[4].smiles is None
+
+
+@pytest.mark.parametrize(
+    'chain',
+    (
+        {'type': 'ligand', 'sequence': 'MK'},  # ligand must not have a sequence
+        {'type': 'ligand'},  # neither smiles nor ccd
+        {'type': 'ligand', 'smiles': 'CCO', 'ccd': ['HEM']},  # both
+        {'type': 'protein', 'sequence': 'MK', 'smiles': 'CCO'},  # polymer w/ ligand
+        {'type': 'dna', 'sequence': 'ACGU'},  # U is not a DNA base
+        {'type': 'rna', 'sequence': 'ACGT'},  # T is not an RNA base
+        {'type': 'protein'},  # polymer with no sequence
+    ),
+)
+def test_invalid_chain_shapes_are_rejected(
+    client: TestClient,
+    chain: dict[str, Any],
+) -> None:
+    response = client.post(
+        '/v1/fold',
+        json={'model': 'esmfold2', 'sequences': [chain]},
+    )
+    assert response.status_code == HTTP_422_UNPROCESSABLE_CONTENT
+
+
+def test_ligand_only_fold_is_rejected(client: TestClient) -> None:
+    response = client.post(
+        '/v1/fold',
+        json={
+            'model': 'esmfold2',
+            'sequences': [{'type': 'ligand', 'smiles': 'CCO'}],
+        },
+    )
+    assert response.status_code == HTTP_422_UNPROCESSABLE_CONTENT
+
+
 def test_lowercase_sequence_is_uppercased() -> None:
     backend = FakeBackend()
     client = TestClient(create_app(Settings(), backend))
@@ -362,6 +497,27 @@ def _install_fake_esm(
             self.id = id
             self.sequence = sequence
 
+    class DNAInput:
+        def __init__(self, id: str, sequence: str) -> None:
+            self.id = id
+            self.sequence = sequence
+
+    class RNAInput:
+        def __init__(self, id: str, sequence: str) -> None:
+            self.id = id
+            self.sequence = sequence
+
+    class LigandInput:
+        def __init__(
+            self,
+            id: str,
+            smiles: str | None = None,
+            ccd: list[str] | None = None,
+        ) -> None:
+            self.id = id
+            self.smiles = smiles
+            self.ccd = ccd
+
     class StructurePredictionInput:
         def __init__(self, sequences: list[Any]) -> None:
             self.sequences = sequences
@@ -395,7 +551,9 @@ def _install_fake_esm(
         def fold(self, model: object, spi: Any, **kwargs: object) -> Any:
             type(self).last_spi = spi
             type(self).last_kwargs = kwargs
-            total = sum(len(chain.sequence) for chain in spi.sequences)
+            total = sum(
+                len(getattr(chain, 'sequence', '') or '') for chain in spi.sequences
+            )
             plddt = torch.arange(total, dtype=torch.float32)
             pae = torch.tensor([[0.0, 1.0], [2.0, 3.0]])
             samples = int(kwargs.get('num_diffusion_samples', 1))  # type: ignore[call-overload]
@@ -410,6 +568,9 @@ def _install_fake_esm(
     module = types.ModuleType('esm.models.esmfold2')
     module.EsmFold2Model = EsmFold2Model  # type: ignore[attr-defined]
     module.ProteinInput = ProteinInput  # type: ignore[attr-defined]
+    module.DNAInput = DNAInput  # type: ignore[attr-defined]
+    module.RNAInput = RNAInput  # type: ignore[attr-defined]
+    module.LigandInput = LigandInput  # type: ignore[attr-defined]
     module.StructurePredictionInput = StructurePredictionInput  # type: ignore[attr-defined]
     module.ESMFold2InputBuilder = ESMFold2InputBuilder  # type: ignore[attr-defined]
 

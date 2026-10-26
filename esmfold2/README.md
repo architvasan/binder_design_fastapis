@@ -49,6 +49,38 @@ curl http://localhost:8000/v1/fold -H 'Content-Type: application/json' -d '{
 }'
 ```
 
+### Chain types: protein, DNA, RNA, ligand
+
+Each chain carries a `type` (default `protein`). Protein/DNA/RNA chains carry a
+`sequence`; a `ligand` carries **exactly one** of `smiles` or `ccd` (a list of
+CCD component codes) and **no** `sequence`. At least one protein/DNA/RNA chain is
+required — a ligand-only request is rejected. Sequence alphabets are validated
+per type (protein = amino acids; DNA = `ACGTN`; RNA = `ACGUN`), and SMILES is
+kept case-sensitive.
+
+```bash
+# protein + nucleic acid (DNA here; use "rna" with a U-containing sequence for RNA)
+curl http://localhost:8000/v1/fold -H 'Content-Type: application/json' -d '{
+  "model": "esmfold2",
+  "sequences": [
+    {"type": "protein", "sequence": "MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQ"},
+    {"type": "dna", "sequence": "ACGTACGTACGT"}
+  ]
+}'
+
+# protein + ligand (SMILES; or pass "ccd": ["HEM"] instead of "smiles")
+curl http://localhost:8000/v1/fold -H 'Content-Type: application/json' -d '{
+  "model": "esmfold2",
+  "sequences": [
+    {"type": "protein", "sequence": "MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQ"},
+    {"type": "ligand", "smiles": "CC(=O)Oc1ccccc1C(=O)O"}
+  ]
+}'
+```
+
+`usage.total_residues` counts polymer residues only; ligands contribute no
+residues.
+
 Response — `results` holds one entry per diffusion sample, **ranked best
 structure first** (by `ranking_score`). Each sample's `structure` is mmCIF text
 and `plddt` is per-residue:
@@ -86,7 +118,8 @@ caller can pick an alternative.
 | Field | Default | Notes |
 | --- | --- | --- |
 | `model` | — | `esmfold2` or `esmfold2-fast` |
-| `sequences` | — | list of `{sequence, id?}`; ≥1 chain |
+| `sequences` | — | list of chains; ≥1, and ≥1 must be protein/dna/rna |
+| chain `type` | `protein` | `protein`/`dna`/`rna` (need `sequence`) or `ligand` (needs `smiles` or `ccd`) |
 | `num_loops` | 20 | recycling loops (1–100) |
 | `num_sampling_steps` | 100 | diffusion steps (1–500) |
 | `num_diffusion_samples` | 1 | samples per fold (1–10) |
@@ -106,10 +139,11 @@ GET  /health
 
 ## Design notes
 
-- **Multichain is native** to ESMFold2: each `ProteinInput(id, sequence)` is a
-  separate chain in a single `StructurePredictionInput`. The container also
-  accepts DNA/RNA/ligand inputs, so extending to non-protein chains is a small
-  addition to `ChainInput`/`fold`.
+- **Multichain is native** to ESMFold2: each chain is a separate input in a
+  single `StructurePredictionInput`. The service maps each `ChainInput` to the
+  SDK input class its `type` selects — `ProteinInput`, `DNAInput`, `RNAInput`,
+  or `LigandInput` (SMILES or CCD) — so protein, nucleic-acid, and small-molecule
+  components fold together in one complex.
 - **Transport:** mmCIF is returned inline. For single-sequence folds this is
   small. If very long multi-chain inputs become common, add a shared-storage
   path option (the archetype-B pattern) rather than inflating the JSON.

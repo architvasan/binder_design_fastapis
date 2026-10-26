@@ -60,6 +60,19 @@ MODEL_REPOS = {
 # Accepted residue alphabet: the 20 standard amino acids plus the ambiguity and
 # non-standard codes ESMFold2 tolerates (X/B/U/Z/O).
 _AA_ALPHABET = frozenset('ACDEFGHIKLMNPQRSTVWYXBUZO')
+# Nucleotide alphabets (N = any base). RNA uses U where DNA uses T.
+_DNA_ALPHABET = frozenset('ACGTN')
+_RNA_ALPHABET = frozenset('ACGUN')
+# Per-type polymer alphabet and a human-readable label for error messages.
+_POLYMER_ALPHABETS = {
+    'protein': (_AA_ALPHABET, 'amino-acid'),
+    'dna': (_DNA_ALPHABET, 'DNA'),
+    'rna': (_RNA_ALPHABET, 'RNA'),
+}
+
+# A chain is a protein/DNA/RNA polymer (carries a ``sequence``) or a ligand
+# (carries ``smiles`` or ``ccd``). ESMFold2 folds them together in one complex.
+ChainType = Literal['protein', 'dna', 'rna', 'ligand']
 
 
 class Settings(BaseSettings):
@@ -88,27 +101,33 @@ class Settings(BaseSettings):
 
 
 class ChainInput(BaseModel):
-    """One chain of a complex: a sequence and an optional explicit chain id."""
+    """One component of a complex and an optional explicit chain id.
+
+    A ``protein``/``dna``/``rna`` chain carries a ``sequence``. A ``ligand``
+    carries exactly one of ``smiles`` or ``ccd`` (a list of CCD codes) instead,
+    and never a ``sequence``. ``type`` defaults to ``protein`` so a bare
+    ``{"sequence": ...}`` keeps working.
+    """
 
     model_config = ConfigDict(extra='forbid')
 
-    sequence: str
+    type: ChainType = 'protein'
+    sequence: str | None = Field(
+        default=None,
+        description='Polymer sequence (protein/dna/rna chains only).',
+    )
+    smiles: str | None = Field(
+        default=None,
+        description='Ligand SMILES string (ligand chains only).',
+    )
+    ccd: list[str] | None = Field(
+        default=None,
+        description='Ligand CCD component codes (ligand chains only).',
+    )
     id: str | None = Field(
         default=None,
         description='Chain id (e.g. A, B). Assigned automatically when omitted.',
     )
-
-    @field_validator('sequence')
-    @classmethod
-    def validate_sequence(cls, value: str) -> str:
-        """Uppercase and reject empty or non-amino-acid sequences."""
-        sequence = value.strip().upper()
-        if not sequence:
-            raise ValueError('sequence must be a non-empty amino-acid string')
-        invalid = sorted(set(sequence) - _AA_ALPHABET)
-        if invalid:
-            raise ValueError(f'sequence has invalid residues: {invalid}')
-        return sequence
 
     @field_validator('id')
     @classmethod
@@ -118,13 +137,55 @@ class ChainInput(BaseModel):
             raise ValueError('chain id must be non-empty when provided')
         return value
 
+    @model_validator(mode='after')
+    def validate_chain(self) -> ChainInput:
+        """Enforce the fields and alphabet that match the chain ``type``."""
+        if self.type == 'ligand':
+            if self.sequence is not None:
+                raise ValueError('ligand chain has no sequence; use smiles or ccd')
+            has_smiles = bool(self.smiles and self.smiles.strip())
+            has_ccd = bool(self.ccd)
+            if has_smiles == has_ccd:
+                raise ValueError('ligand chain requires exactly one of smiles or ccd')
+            if has_smiles:
+                # SMILES is case-sensitive (c vs C); strip only.
+                self.smiles = cast(str, self.smiles).strip()
+            else:
+                codes = [code.strip().upper() for code in cast('list[str]', self.ccd)]
+                if any(not code for code in codes):
+                    raise ValueError('ccd codes must be non-empty')
+                self.ccd = codes
+            return self
+
+        # protein / dna / rna: a sequence, never ligand fields.
+        if self.smiles is not None or self.ccd is not None:
+            raise ValueError(f'{self.type} chain must not carry smiles or ccd')
+        if self.sequence is None:
+            raise ValueError(f'{self.type} chain requires a sequence')
+        sequence = self.sequence.strip().upper()
+        if not sequence:
+            raise ValueError('sequence must be a non-empty string')
+        alphabet, label = _POLYMER_ALPHABETS[self.type]
+        invalid = sorted(set(sequence) - alphabet)
+        if invalid:
+            raise ValueError(f'{label} sequence has invalid residues: {invalid}')
+        self.sequence = sequence
+        return self
+
 
 @dataclass(frozen=True)
 class ChainSpec:
-    """A resolved chain (id guaranteed) handed to the backend."""
+    """A resolved chain (id guaranteed) handed to the backend.
+
+    ``sequence`` is set for protein/dna/rna chains; ``smiles``/``ccd`` for
+    ligands. ``type`` selects the SDK input class the backend builds.
+    """
 
     id: str
-    sequence: str
+    type: str = 'protein'
+    sequence: str | None = None
+    smiles: str | None = None
+    ccd: tuple[str, ...] | None = None
 
 
 def _next_chain_id(used: set[str]) -> str:
@@ -172,7 +233,9 @@ class FoldRequest(BaseModel):
 
     @model_validator(mode='after')
     def assign_chain_ids(self) -> FoldRequest:
-        """Reject duplicate ids and auto-assign ids to chains that lack one."""
+        """Reject a ligand-only fold, dedupe ids, and auto-assign missing ones."""
+        if all(chain.type == 'ligand' for chain in self.sequences):
+            raise ValueError('at least one protein, dna, or rna chain is required')
         used: set[str] = set()
         for chain in self.sequences:
             if chain.id is not None:
@@ -188,7 +251,13 @@ class FoldRequest(BaseModel):
     def resolved_chains(self) -> list[ChainSpec]:
         """Return chains with ids resolved (always set after validation)."""
         return [
-            ChainSpec(id=cast(str, chain.id), sequence=chain.sequence)
+            ChainSpec(
+                id=cast(str, chain.id),
+                type=chain.type,
+                sequence=chain.sequence,
+                smiles=chain.smiles,
+                ccd=tuple(chain.ccd) if chain.ccd is not None else None,
+            )
             for chain in self.sequences
         ]
 
@@ -345,17 +414,33 @@ class EsmFold2Backend:
         return_pae: bool,
     ) -> list[FoldOutput]:
         """Fold the chains and map every sample to a FoldOutput."""
+        from esm.models.esmfold2 import DNAInput  # noqa: PLC0415
         from esm.models.esmfold2 import ESMFold2InputBuilder  # noqa: PLC0415
+        from esm.models.esmfold2 import LigandInput  # noqa: PLC0415
         from esm.models.esmfold2 import ProteinInput  # noqa: PLC0415
+        from esm.models.esmfold2 import RNAInput  # noqa: PLC0415
         from esm.models.esmfold2 import StructurePredictionInput  # noqa: PLC0415
+
+        def build_input(chain: ChainSpec) -> Any:
+            """Map a resolved chain to its ESMFold2 SDK input dataclass."""
+            if chain.type == 'protein':
+                return ProteinInput(id=chain.id, sequence=chain.sequence)
+            if chain.type == 'dna':
+                return DNAInput(id=chain.id, sequence=chain.sequence)
+            if chain.type == 'rna':
+                return RNAInput(id=chain.id, sequence=chain.sequence)
+            # ligand: carries smiles or ccd, never a sequence.
+            return LigandInput(
+                id=chain.id,
+                smiles=chain.smiles,
+                ccd=list(chain.ccd) if chain.ccd is not None else None,
+            )
 
         loaded = self.load(model)
         # ESMFold2 exposes custom methods beyond the nn.Module interface.
         net = cast(Any, loaded.model)
         spi = StructurePredictionInput(
-            sequences=[
-                ProteinInput(id=chain.id, sequence=chain.sequence) for chain in chains
-            ],
+            sequences=[build_input(chain) for chain in chains],
         )
 
         with torch.inference_mode():
@@ -479,7 +564,9 @@ def create_app(
             results=samples,
             usage=FoldUsage(
                 num_chains=len(chains),
-                total_residues=sum(len(chain.sequence) for chain in chains),
+                total_residues=sum(
+                    len(chain.sequence) for chain in chains if chain.sequence
+                ),
             ),
         )
 
