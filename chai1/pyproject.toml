@@ -1,0 +1,153 @@
+[build-system]
+requires = ["setuptools>=84.0.0", "setuptools_scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chai1-service"
+version = "0.1.0"
+description = "FastAPI service for Chai-1 co-folding"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+authors = [
+    {name = "Archit Vasan", email = "avasan@anl.gov"},
+]
+license = "MIT"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+dependencies = [
+    "chai_lab>=0.6",
+    "fastapi>=0.115",
+    "pydantic-settings>=2.0",
+    "torch>=2.2",
+    "uvicorn[standard]>=0.30",
+]
+
+[project.urls]
+homepage = "https://github.com/architvasan/binder_design_fastapis"
+repository = "https://github.com/architvasan/binder_design_fastapis"
+
+[project.optional-dependencies]
+dev = [
+    "codespell",
+    "covdefaults>=2.3.0",
+    "coverage",
+    "httpx>=0.27",
+    "mypy",
+    "pre-commit",
+    "pytest",
+    "pytest-cov",
+    "ruff",
+]
+
+[project.scripts]
+chai-serve = "chai1_service.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = [
+    "--cov=chai1_service",
+    "--cov-report=term-missing",
+    "--no-cov-on-fail",
+]
+
+[tool.coverage.run]
+plugins = ["covdefaults"]
+
+[tool.coverage.report]
+fail_under = 75
+
+[tool.codespell]
+skip = """
+.git,
+.github,
+__pycache__,
+build,
+dist,
+.*egg-info,
+uv.lock
+"""
+
+[tool.ruff]
+lint.select = [
+    "F",
+    "E",
+    "I",
+    "N",
+    "D",
+    "UP",
+    "B",
+    "A",
+    "COM",
+    "C4",
+    "ISC",
+    "PT",
+    "Q",
+    "T10",
+    "PL",
+    "RUF",
+]
+line-length = 88
+lint.extend-ignore = []
+target-version = "py310"
+lint.ignore = [
+    "COM812",
+    "ISC001",
+    "D401",
+    "A002",
+    "A003",
+    "PLW2901",
+    "RUF012",
+    "N803",
+    "N806",
+    "PLR0913",
+    "RUF001",
+]
+
+[tool.ruff.lint.pycodestyle]
+ignore-overlong-task-comments = true
+
+[tool.ruff.lint.flake8-pytest-style]
+parametrize-values-type = "tuple"
+
+[tool.ruff.lint.flake8-quotes]
+inline-quotes = "single"
+multiline-quotes = "double"
+
+[tool.ruff.lint.isort]
+force-single-line = true
+known-first-party = ["chai1_service", "test", "testing"]
+order-by-type = false
+required-imports = ["from __future__ import annotations"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.ruff.lint.per-file-ignores]
+"*/__init__.py" = ["F401"]
+"tests/*.py" = ["D10", "PLR2004"]
+
+[tool.ruff.format]
+quote-style = "single"
+
+[tool.mypy]
+python_version = "3.10"
+check_untyped_defs = true
+disallow_incomplete_defs = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_configs = true
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = ["chai_lab.*", "torch", "torch.*"]
+ignore_missing_imports = true
