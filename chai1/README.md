@@ -1,98 +1,143 @@
-# chai1-service (design draft)
+# chai1-service
 
-Archetype **B** — async fold job. Worked example for Chai-1 / Boltz-2 / ESMFold2.
+A FastAPI wrapper around **Chai-1** (`chai_lab.chai1.run_inference`) that co-folds
+a complex of protein / DNA / RNA / ligand chains and returns the predicted
+structures as mmCIF plus Chai-1's ranking scores.
 
-Wraps `chai_lab.chai1.run_inference` and exposes co-folding over HTTP. Folds a
-protein complex (optionally with ligands, metals, glycans, MSA, and residue
-constraints) and returns ranked structures with interface-confidence scores.
+Same shape as the other services in this repo: typed `Settings`, an injectable
+backend `Protocol` (so the API is tested without a GPU or weights), inference
+serialized per process. Each request folds one complex and returns the
+structures **synchronously, inline in the JSON response**, ranked best-first.
 
-## Backend API being wrapped
+**Status: implemented and tested** (`src/chai1_service/server.py` + `tests/`).
+ruff, mypy, and the pytest suite pass (API validation, chain-name assignment,
+FASTA rendering, and the candidate-ranking/score mapping against a stubbed
+`chai_lab`). The real `run_inference` call is exercised through an injected fake
+module; a live GPU run still needs `chai_lab` weights on a healthy accelerator.
 
-`chai_lab.chai1.run_inference` (chai-lab repo, `chai_lab/chai1.py:450`):
+## Install and run
 
-```python
-run_inference(
-    fasta_file: Path, *, output_dir: Path,
-    use_esm_embeddings=True, use_msa_server=False, msa_server_url=..., msa_directory=None,
-    constraint_path: Path | None = None,
-    num_trunk_recycles=3, num_diffn_timesteps=200, num_diffn_samples=5,
-    seed: int | None = None, device: str | None = None, low_memory=True,
-) -> StructureCandidates   # .cif_paths, .ranking_data[SampleRanking], .pae, .sorted()
+```bash
+cd chai1
+uv venv && source .venv/bin/activate
+uv pip install -e ".[dev]"      # pulls chai_lab + torch (large)
+chai-serve                       # http://localhost:8000
 ```
 
-- **Input** is a FASTA whose headers carry entity type: `>protein|name=A`,
-  `>ligand|name=L` (sequence = SMILES), `>rna|...`, `>dna|...`. Constraints are a
-  separate CSV. MSA is a directory (or `use_msa_server=True`).
-- **Output** is `num_diffn_samples` CIF files + a `SampleRanking` each
-  (`aggregate_score`, pTM/ipTM via `ptm_scores`, `clash_scores`). `.sorted()`
-  ranks by `aggregate_score`.
+Chai-1 downloads its weights on the first fold. Settings come from `CHAI_*`
+environment variables (see `.env.example`): `CHAI_DEVICE`, `CHAI_SCRATCH_DIR`,
+`CHAI_USE_ESM_EMBEDDINGS`, `CHAI_USE_MSA_SERVER`, `CHAI_HOST`, `CHAI_PORT`.
 
-## Intended HTTP contract
+## Fold a complex
 
-```
-POST /v1/fold/jobs        -> {job_id, status}          (async; runs are minutes)
-GET  /v1/fold/jobs/{id}   -> {status, result?}
-POST /v1/fold             -> blocking single fold       (for quick calls / tests)
-GET  /health
-```
+Each entry in `chains` is one component. Protein/DNA/RNA chains carry a
+`sequence`; a `ligand` carries a `smiles` string. Give an explicit `name` or let
+the service assign `A`, `B`, `C`, … in order. At least one protein/DNA/RNA chain
+is required (a ligand-only request is rejected).
 
-### FoldRequest (new)
-```jsonc
-{
+```bash
+# protein + protein + ligand holo-complex
+curl http://localhost:8000/v1/fold -H 'Content-Type: application/json' -d '{
   "chains": [
-    {"entity_type": "protein", "sequence": "MKT...", "name": "target"},
-    {"entity_type": "protein", "sequence": "GSHM...", "name": "binder"},
-    {"entity_type": "ligand",  "smiles": "CC(=O)O", "name": "lig"}      // optional
+    {"entity_type": "protein", "sequence": "MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQ", "name": "target"},
+    {"entity_type": "protein", "sequence": "GSHMKLVINGKTLKGEITVELDTGELLHKFTNG", "name": "binder"},
+    {"entity_type": "ligand",  "smiles": "CC(=O)Oc1ccccc1C(=O)O", "name": "lig"}
   ],
-  "constraints": [                                                       // optional
-    {"chain_a": "target", "res_a": 45, "chain_b": "binder", "res_b": 3, "max_dist": 8.0}
-  ],
-  "use_msa_server": false,          // or supply precomputed MSA
-  "use_esm_embeddings": true,
   "num_diffn_samples": 5,
   "num_trunk_recycles": 3,
   "num_diffn_timesteps": 200,
   "seed": 42
-}
+}'
 ```
 
-### FoldResponse (new)
-```jsonc
+Response — `results` holds one entry per diffusion sample, **ranked best-first**
+by Chai-1's `sorted()` (descending `aggregate_score`). Each sample's `structure`
+is mmCIF text:
+
+```json
 {
   "object": "fold",
   "model": "chai-1",
-  "data": [                         // sorted best-first
-    {"index": 0, "cif": "<CIF text or artifact path>",
-     "scores": {"aggregate_score": .., "ptm": .., "iptm": .., "clash": ..}}
+  "num_chains": 3,
+  "chain_names": ["target", "binder", "lig"],
+  "num_samples": 5,
+  "results": [
+    {
+      "format": "mmcif",
+      "structure": "data_...",
+      "scores": {
+        "aggregate_score": 0.83,
+        "complex_ptm": 0.81,
+        "interface_ptm": 0.62,
+        "has_inter_chain_clashes": false
+      },
+      "pae": null
+    }
   ],
-  "meta": {"num_samples": 5, "seed": 42, "runtime_s": ..}
+  "usage": {"num_chains": 3, "total_residues": 66}
 }
 ```
 
+`aggregate_score` is Chai-1's own ranking metric
+(`0.2*complex_ptm + 0.8*interface_ptm - 100*has_inter_chain_clashes`); samples
+are returned in that order.
+
+### Request fields
+
+| Field | Default | Notes |
+| --- | --- | --- |
+| `chains` | — | list of components; ≥1, and ≥1 must be protein/dna/rna |
+| chain `entity_type` | `protein` | `protein`/`dna`/`rna` (need `sequence`) or `ligand` (needs `smiles`) |
+| `use_esm_embeddings` | service default | override per request |
+| `use_msa_server` | service default | ColabFold MSA server (needs network) |
+| `num_trunk_recycles` | 3 | 1–10 |
+| `num_diffn_timesteps` | 200 | 1–500 |
+| `num_diffn_samples` | 5 | 1–5 |
+| `seed` | null | RNG seed |
+| `return_pae` | false | include the (large) PAE matrix |
+
+## HTTP contract
+
+```
+POST /v1/fold   -> {object:'fold', model, chain_names, num_samples, results:[{structure, scores, pae?}], usage}
+GET  /health
+```
+
+## Design notes
+
+- **Co-folding is native** to Chai-1: each chain becomes a FASTA record whose
+  header carries the entity type (`>protein|name=A`, `>ligand|name=L` with the
+  SMILES as the body). The backend writes the FASTA to a scratch dir, calls
+  `run_inference`, and reads back the ranked CIFs + `SampleRanking` scores.
+- **Transport:** mmCIF is returned inline, like the ESMFold2 service. For large
+  multi-sample outputs a shared-storage path option (the archetype-B pattern)
+  would be the next step.
+- **Scores** come from `SampleRanking`: `aggregate_score`, `ptm_scores`
+  (`complex_ptm`, `interface_ptm`), and `clash_scores.has_inter_chain_clashes`.
+
+## Deferred (documented follow-ups)
+
+Sketched in the original design draft but intentionally **not** implemented here,
+to keep the first cut small and testable (mirrors how the ESMFold2 service
+deferred its async API):
+
+- **Async job API** (`POST /v1/fold/jobs` + `GET /v1/fold/jobs/{id}`). Runs are
+  minutes; a job store would decouple the HTTP request from the run. The sync
+  endpoint is the single-fold path for now.
+- **Residue constraints** (the Chai-1 constraint CSV). Modeled in the draft but
+  the exact CSV schema is unverified, so it is left out rather than guessed.
+- **Precomputed MSA directory** (`msa_directory`). Only the `use_msa_server`
+  toggle is exposed today.
+
 ## What copies from the template vs. what is new
 
-| Box | Action | Template anchor |
-| --- | --- | --- |
-| `ChaiSettings` | copy shape, new fields (device, scratch_dir, msa/esm flags, sampling defaults) | server.py:57 |
-| allowlist | replace `MODEL_LAYER_COUNTS` with `ENTITY_TYPES` + alphabets | server.py:41 |
-| `FoldRequest` / validators | **new**; keep `extra='forbid'`; per-entity alphabet, SMILES, constraint-range | server.py:86 / :104 / :122 |
-| `FoldResponse` / `Structure` | **new**; scores from `SampleRanking` | server.py:162 |
-| `FoldBackend(Protocol)` | copy; methods `load`/`unload`/`fold` | server.py:171 |
-| `ChaiFoldBackend.load`/`unload` | copy one-resident + free | server.py:208 / :237 |
-| `ChaiFoldBackend.fold` | **new**: build FASTA → `run_inference` → read CIF+scores → sort | replaces server.py:246 (embed) |
-| `create_app` / lifespan / lock | copy | server.py:305 / :314 / :312 |
-| `/health` / `main` | copy ~verbatim | server.py:332 / :376 |
-| async job store + worker | **new** (see `_pattern/PATTERN.md`) | — |
-| packaging envelope | copy; swap dep → `chai_lab`, scripts → `chai-serve` | pyproject.toml |
-
-## Open decisions
-
-- **CIF transport:** base64 in JSON vs. write to shared storage + return a path.
-  Decide repo-wide (affects all archetype-B/C services).
-- **Holo folding:** ligand/metal/glycan chains come in via `entity_type`; mirror
-  the `cofactor-ligand-setup` conventions so metalloenzyme targets fold with a
-  physiological pocket.
-- **MSA:** allow `use_msa_server` (ColabFold) vs. require precomputed MSA dir
-  for offline/HPC runs.
-- **Weights/device:** Chai downloads weights on first use; preload in `lifespan`
-  and pin to the process's GPU.
+| Box | Action |
+| --- | --- |
+| `Settings` | copy; env prefix `CHAI_`; new fields (device, scratch_dir, msa/esm flags) |
+| allowlist | → `EntityType` + polymer alphabets (no model-name allowlist; Chai-1 is one model) |
+| request/response models | new: `FoldRequest`/`ChainInput`/`FoldResponse`/`FoldScores` |
+| `FoldBackend(Protocol)` | copy; methods `load`/`unload`/`fold` |
+| `ChaiFoldBackend.fold` | new: build FASTA → `run_inference` → read CIF + scores → map |
+| `create_app` / lifespan / lock / routes / `main` | copy; route `/v1/fold` |
+| packaging envelope | copy; dep → `chai_lab`, scripts → `chai-serve` |
+| test strategy | copy: `FakeBackend` + injected fake `chai_lab` module |
