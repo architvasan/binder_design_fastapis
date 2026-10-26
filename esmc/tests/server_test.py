@@ -85,6 +85,19 @@ def test_transformer_layer_defaults_to_model_final_layer() -> None:
     assert backend.transformer_layers == [30]
 
 
+def test_transformer_layer_defaults_to_final_layer_for_6b() -> None:
+    backend = FakeBackend()
+    client = TestClient(create_app(Settings(), backend))
+
+    response = client.post(
+        '/v1/embeddings',
+        json={'model': 'esmc_6b', 'input': ['MK']},
+    )
+
+    assert response.status_code == HTTP_200_OK
+    assert backend.transformer_layers == [80]
+
+
 def test_requested_transformer_layer_is_forwarded() -> None:
     backend = FakeBackend()
     client = TestClient(create_app(Settings(), backend))
@@ -103,6 +116,7 @@ def test_requested_transformer_layer_is_forwarded() -> None:
     (
         ('esmc_300m', 31),
         ('esmc_600m', 37),
+        ('esmc_6b', 81),
     ),
 )
 def test_transformer_layer_must_exist(
@@ -260,10 +274,16 @@ class _FakeLogitsOutput:
 
 
 class _FakeEsmcModel(torch.nn.Module):
-    """A model whose hidden state at [layer, 0, token] equals layer*100+token.
+    """A model whose block-k hidden state at token t equals k*100+t.
 
-    This makes the expected mean-pool over residues exactly computable, so the
-    test pins the layer indexing and the BOS/EOS exclusion in ``embed``.
+    Mirrors the real ESM-C single-layer request: ``embed`` asks for one layer
+    via ``ith_hidden_layer`` (0-based, index 0 = the first block's output) and
+    the SDK returns a tensor of shape ``[1, batch, length, dim]``. So a 1-based
+    block k is requested as ``ith_hidden_layer = k - 1`` and this fake returns
+    block ``ith_hidden_layer + 1``'s values. This makes the expected mean-pool
+    over residues exactly computable, pinning the layer indexing and the
+    BOS/EOS exclusion in ``embed``. ``ith_hidden_layer`` beyond ``n_layers - 1``
+    returns an empty ``[0, ...]`` tensor, as the real SDK does out of range.
     """
 
     def __init__(self, n_layers: int, dim: int = 4) -> None:
@@ -277,10 +297,13 @@ class _FakeEsmcModel(torch.nn.Module):
     def logits(self, tensor: object, config: object) -> _FakeLogitsOutput:
         length = len(tensor.sequence)  # type: ignore[attr-defined]
         n_tokens = length + 2  # ESM-C adds BOS and EOS
-        hidden = torch.zeros(self.n_layers + 1, 1, n_tokens, self.dim)
-        for layer in range(self.n_layers + 1):
-            for token in range(n_tokens):
-                hidden[layer, 0, token, :] = layer * 100 + token
+        ith = config.kwargs['ith_hidden_layer']  # type: ignore[attr-defined]
+        if not 0 <= ith < self.n_layers:
+            return _FakeLogitsOutput(torch.zeros(0, 1, n_tokens, self.dim))
+        block = ith + 1
+        hidden = torch.zeros(1, 1, n_tokens, self.dim)
+        for token in range(n_tokens):
+            hidden[0, 0, token, :] = block * 100 + token
         return _FakeLogitsOutput(hidden)
 
 
@@ -349,13 +372,28 @@ def test_embed_final_layer_and_multiple_sequences(
     assert vectors == [[3601.5, 3601.5], [3602.0, 3602.0]]
 
 
-def test_embed_rejects_unexpected_layer_count(
+def test_embed_6b_final_layer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(torch.cuda, 'is_available', lambda: False)
-    # Model reports 10 layers but esmc_300m expects 30 -> guard must fire.
+    _install_fake_esm_for_embed(monkeypatch, _FakeEsmcModel(n_layers=80, dim=2))
+
+    backend = EsmcEmbeddingBackend(Settings())
+    # esmc_6b final layer = 80. 'MK' residues are tokens 1,2:
+    # 8000 + mean(1,2) = 8001.5.
+    vectors = backend.embed('esmc_6b', ['MK'], transformer_layer=80)
+
+    assert vectors == [[8001.5, 8001.5]]
+
+
+def test_embed_rejects_empty_hidden_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: False)
+    # The model exposes 10 layers; requesting layer 11 (ith_hidden_layer 10)
+    # is out of range, so the SDK returns an empty tensor and the guard fires.
     _install_fake_esm_for_embed(monkeypatch, _FakeEsmcModel(n_layers=10, dim=4))
 
     backend = EsmcEmbeddingBackend(Settings())
-    with pytest.raises(RuntimeError, match='expected 31 hidden layers'):
-        backend.embed('esmc_300m', ['AAA'], transformer_layer=5)
+    with pytest.raises(RuntimeError, match='expected one hidden state'):
+        backend.embed('esmc_300m', ['AAA'], transformer_layer=11)
